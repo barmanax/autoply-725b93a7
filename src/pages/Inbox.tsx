@@ -1,11 +1,13 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/hooks/useAuth";
+import { useToast } from "@/hooks/use-toast";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Inbox as InboxIcon, Settings, Building2, MapPin, ExternalLink } from "lucide-react";
+import { Inbox as InboxIcon, Settings, Building2, MapPin, ExternalLink, Trash2, Loader2 } from "lucide-react";
 
 type JobMatch = {
   id: string;
@@ -21,6 +23,10 @@ type JobMatch = {
 };
 
 export default function Inbox() {
+  const { user } = useAuth();
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
+
   const { data: matches, isLoading, error } = useQuery({
     queryKey: ["job-matches"],
     queryFn: async () => {
@@ -42,6 +48,64 @@ export default function Inbox() {
 
       if (error) throw error;
       return data as JobMatch[];
+    },
+  });
+
+  const clearInbox = useMutation({
+    mutationFn: async () => {
+      if (!user) throw new Error("Not authenticated");
+
+      // Get all job matches for this user
+      const { data: userMatches, error: matchError } = await supabase
+        .from("job_matches")
+        .select("id")
+        .eq("user_id", user.id);
+
+      if (matchError) throw matchError;
+
+      const matchIds = userMatches?.map(m => m.id) || [];
+
+      if (matchIds.length > 0) {
+        // Delete application drafts first (foreign key constraint)
+        const { error: draftsError } = await supabase
+          .from("application_drafts")
+          .delete()
+          .in("job_match_id", matchIds);
+
+        if (draftsError) throw draftsError;
+
+        // Delete submission events
+        const { error: eventsError } = await supabase
+          .from("submission_events")
+          .delete()
+          .in("job_match_id", matchIds);
+
+        if (eventsError) throw eventsError;
+
+        // Delete job matches
+        const { error: matchesDeleteError } = await supabase
+          .from("job_matches")
+          .delete()
+          .eq("user_id", user.id);
+
+        if (matchesDeleteError) throw matchesDeleteError;
+      }
+
+      return matchIds.length;
+    },
+    onSuccess: (count) => {
+      queryClient.invalidateQueries({ queryKey: ["job-matches"] });
+      toast({
+        title: "Inbox cleared",
+        description: `Removed ${count} job matches and their drafts.`,
+      });
+    },
+    onError: (error) => {
+      toast({
+        title: "Failed to clear inbox",
+        description: error instanceof Error ? error.message : "Unknown error",
+        variant: "destructive",
+      });
     },
   });
 
@@ -76,12 +140,26 @@ export default function Inbox() {
             Your matched jobs and application status
           </p>
         </div>
-        <Button asChild variant="outline">
-          <Link to="/admin/run">
-            <Settings className="h-4 w-4 mr-2" />
-            Admin Run
-          </Link>
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            onClick={() => clearInbox.mutate()}
+            disabled={clearInbox.isPending || !matches?.length}
+          >
+            {clearInbox.isPending ? (
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+            ) : (
+              <Trash2 className="h-4 w-4 mr-2" />
+            )}
+            Clear Inbox
+          </Button>
+          <Button asChild variant="outline">
+            <Link to="/admin/run">
+              <Settings className="h-4 w-4 mr-2" />
+              Admin Run
+            </Link>
+          </Button>
+        </div>
       </div>
 
       {isLoading && (
