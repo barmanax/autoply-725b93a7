@@ -166,23 +166,38 @@ export type Database = {
         Row: {
           created_at: string | null
           full_name: string | null
+          gender: string | null
+          graduation_date: string | null
           id: string
+          other_info: string | null
           phone: string | null
           phone_verified: boolean | null
+          race: string | null
+          work_authorization: string | null
         }
         Insert: {
           created_at?: string | null
           full_name?: string | null
+          gender?: string | null
+          graduation_date?: string | null
           id: string
+          other_info?: string | null
           phone?: string | null
           phone_verified?: boolean | null
+          race?: string | null
+          work_authorization?: string | null
         }
         Update: {
           created_at?: string | null
           full_name?: string | null
+          gender?: string | null
+          graduation_date?: string | null
           id?: string
+          other_info?: string | null
           phone?: string | null
           phone_verified?: boolean | null
+          race?: string | null
+          work_authorization?: string | null
         }
         Relationships: []
       }
