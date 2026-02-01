@@ -15,8 +15,11 @@ import {
   Target,
   FileText,
   ArrowRight,
-  AlertCircle
+  AlertCircle,
+  RotateCcw,
+  Trash2
 } from "lucide-react";
+import { toast } from "sonner";
 
 interface PipelineStep {
   id: string;
@@ -46,6 +49,7 @@ const stepIcons: Record<string, typeof Search> = {
 export default function AdminRun() {
   const navigate = useNavigate();
   const [result, setResult] = useState<PipelineResult | null>(null);
+  const [isResetting, setIsResetting] = useState(false);
 
   // Check onboarding status
   const { data: onboardingStatus } = useQuery({
@@ -70,6 +74,54 @@ export default function AdminRun() {
       return { complete: missing.length === 0, missing };
     },
   });
+
+  // Reset demo data
+  const handleResetDemo = async () => {
+    setIsResetting(true);
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error("Not authenticated");
+
+      // Get all job matches for this user
+      const { data: matches } = await supabase
+        .from("job_matches")
+        .select("id")
+        .eq("user_id", user.id);
+
+      if (matches && matches.length > 0) {
+        const matchIds = matches.map(m => m.id);
+
+        // Delete application drafts first (foreign key constraint)
+        await supabase
+          .from("application_drafts")
+          .delete()
+          .in("job_match_id", matchIds);
+
+        // Delete submission events
+        await supabase
+          .from("submission_events")
+          .delete()
+          .in("job_match_id", matchIds);
+
+        // Delete job matches
+        await supabase
+          .from("job_matches")
+          .delete()
+          .eq("user_id", user.id);
+      }
+
+      // Delete all job posts (to re-seed fresh)
+      await supabase.from("job_posts").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+
+      setResult(null);
+      toast.success("Demo reset complete! Ready for a fresh run.");
+    } catch (error) {
+      console.error("Reset error:", error);
+      toast.error("Failed to reset demo data");
+    } finally {
+      setIsResetting(false);
+    }
+  };
 
   const runPipeline = useMutation({
     mutationFn: async () => {
@@ -160,26 +212,45 @@ export default function AdminRun() {
                 </CardDescription>
               </div>
             </div>
-            <Button
-              onClick={() => {
-                setResult(null);
-                runPipeline.mutate();
-              }}
-              disabled={!canRun}
-              size="lg"
-            >
-              {runPipeline.isPending ? (
-                <>
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  Running...
-                </>
-              ) : (
-                <>
-                  <Play className="h-4 w-4 mr-2" />
-                  Run Pipeline
-                </>
-              )}
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                onClick={handleResetDemo}
+                disabled={isResetting || runPipeline.isPending}
+              >
+                {isResetting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Resetting...
+                  </>
+                ) : (
+                  <>
+                    <RotateCcw className="h-4 w-4 mr-2" />
+                    Reset Demo
+                  </>
+                )}
+              </Button>
+              <Button
+                onClick={() => {
+                  setResult(null);
+                  runPipeline.mutate();
+                }}
+                disabled={!canRun}
+                size="lg"
+              >
+                {runPipeline.isPending ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Running...
+                  </>
+                ) : (
+                  <>
+                    <Play className="h-4 w-4 mr-2" />
+                    Run Pipeline
+                  </>
+                )}
+              </Button>
+            </div>
           </div>
         </CardHeader>
         
