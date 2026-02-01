@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
@@ -23,6 +23,7 @@ const preferencesSchema = z.object({
 export default function Onboarding() {
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(false);
+  const [prefillDone, setPrefillDone] = useState(false);
   const navigate = useNavigate();
   const { user } = useAuth();
   const { toast } = useToast();
@@ -45,6 +46,74 @@ export default function Onboarding() {
   const [remoteOk, setRemoteOk] = useState(true);
   const [sponsorshipNeeded, setSponsorshipNeeded] = useState(false);
   const [minSalary, setMinSalary] = useState("");
+
+  useEffect(() => {
+    if (!user || prefillDone) return;
+    let cancelled = false;
+
+    const loadExisting = async () => {
+      try {
+        const [resumeResult, profileResult, prefsResult] = await Promise.all([
+          supabase
+            .from("resumes")
+            .select("resume_text")
+            .eq("user_id", user.id)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+          supabase
+            .from("profiles")
+            .select("graduation_date, gender, race, work_authorization, other_info")
+            .eq("id", user.id)
+            .maybeSingle(),
+          supabase
+            .from("preferences")
+            .select("roles, locations, remote_ok, sponsorship_needed, min_salary")
+            .eq("user_id", user.id)
+            .maybeSingle(),
+        ]);
+
+        if (cancelled) return;
+
+        if (resumeResult.data?.resume_text) {
+          setResumeText(resumeResult.data.resume_text);
+        }
+
+        if (profileResult.data) {
+          const gradDate = profileResult.data.graduation_date
+            ? profileResult.data.graduation_date.slice(0, 7)
+            : "";
+          setGraduationDate(gradDate);
+          setGender(profileResult.data.gender || "");
+          setRace(profileResult.data.race || "");
+          setWorkAuthorization(profileResult.data.work_authorization || "");
+          setOtherInfo(profileResult.data.other_info || "");
+        }
+
+        if (prefsResult.data) {
+          setRoles(prefsResult.data.roles || []);
+          setLocations(prefsResult.data.locations || []);
+          setRemoteOk(prefsResult.data.remote_ok ?? true);
+          setSponsorshipNeeded(prefsResult.data.sponsorship_needed ?? false);
+          setMinSalary(
+            prefsResult.data.min_salary !== null && prefsResult.data.min_salary !== undefined
+              ? String(prefsResult.data.min_salary)
+              : ""
+          );
+        }
+      } catch (error) {
+        console.error("Failed to prefill onboarding:", error);
+      } finally {
+        if (!cancelled) setPrefillDone(true);
+      }
+    };
+
+    loadExisting();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user, prefillDone]);
 
   const handleStep1Next = () => {
     const result = resumeSchema.safeParse({ resumeText });

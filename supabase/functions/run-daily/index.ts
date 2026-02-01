@@ -109,6 +109,55 @@ interface PipelineStep {
   count?: number;
 }
 
+const extractJsonPayload = (raw: string) => {
+  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch?.[1]) return fenceMatch[1].trim();
+
+  const firstBrace = raw.indexOf("{");
+  const lastBrace = raw.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    return raw.slice(firstBrace, lastBrace + 1).trim();
+  }
+
+  return null;
+};
+
+const parseJsonWithRetry = (raw: string) => {
+  const trimmed = raw.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Retry once after extracting a likely JSON block.
+    const extracted = extractJsonPayload(trimmed);
+    if (!extracted || extracted === trimmed) return null;
+    try {
+      return JSON.parse(extracted);
+    } catch {
+      return null;
+    }
+  }
+};
+
+const coerceNumber = (value: unknown, fallback: number) => {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const cleaned = value.replace(/[^0-9.-]/g, "");
+    const parsed = Number(cleaned);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+};
+
+const normalizeAnswers = (value: unknown) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const entries = Object.entries(value as Record<string, unknown>);
+  const normalized: Record<string, string> = {};
+  for (const [question, answer] of entries) {
+    normalized[question] = answer === null || answer === undefined ? "" : String(answer);
+  }
+  return normalized;
+};
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -274,9 +323,14 @@ Deno.serve(async (req) => {
     console.log("Step 2: Scoring job fit...");
 
     const scoredMatches: any[] = [];
+    const allMatches: any[] = [];
     const fitThreshold = 70; // Only draft for jobs with score >= 70
+    const fallbackFitScore = 75;
 
     for (const job of unmatchedJobs) {
+      let fitScore = fallbackFitScore;
+      let reasons: any = {};
+
       try {
         console.log(`Scoring: ${job.title} at ${job.company}`);
         
@@ -309,58 +363,70 @@ Deno.serve(async (req) => {
           ],
         });
 
-        let fitScore = 75;
-        let reasons: any = {};
-        
         const fitContent = fitResponse.choices[0]?.message?.content || "{}";
         console.log(`Fit response for ${job.title}:`, fitContent.substring(0, 200));
-        
-        try {
-          // Try to extract JSON from response (may have markdown code blocks)
-          const jsonMatch = fitContent.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            fitScore = parsed.score || parsed.fit_score || 75;
-            reasons = parsed.reasons || parsed;
-          }
-        } catch (parseError) {
-          console.log("JSON parse failed, using default score");
+
+        const parsed = parseJsonWithRetry(fitContent);
+        if (parsed && typeof parsed === "object") {
+          const parsedRecord = parsed as Record<string, unknown>;
+          fitScore = coerceNumber(parsedRecord.score ?? parsedRecord.fit_score, fallbackFitScore);
+          reasons = parsedRecord.reasons ?? parsedRecord;
         }
-
-        // Normalize score
-        fitScore = Math.min(100, Math.max(0, Math.round(fitScore)));
-        console.log(`Score for ${job.title}: ${fitScore}`);
-
-        // Create match record
-        const { data: match, error: matchError } = await supabase
-          .from("job_matches")
-          .insert({
-            job_post_id: job.id,
-            user_id: user.id,
-            fit_score: fitScore,
-            status: fitScore >= fitThreshold ? "DRAFTED" : "SKIPPED",
-            reasons,
-          })
-          .select()
-          .single();
-
-        if (matchError) {
-          console.error(`Error creating match for ${job.title}:`, matchError);
-          continue;
-        }
-
-        if (fitScore >= fitThreshold) {
-          scoredMatches.push({ match, job });
-        }
-
       } catch (jobError) {
         console.error(`Error scoring ${job.title}:`, jobError);
+        reasons = { error: "FIT_SCORER_FAILED" };
       }
+
+      // Normalize score
+      fitScore = Math.min(100, Math.max(0, Math.round(fitScore)));
+      console.log(`Score for ${job.title}: ${fitScore}`);
+
+      // Create match record
+      const { data: match, error: matchError } = await supabase
+        .from("job_matches")
+        .insert({
+          job_post_id: job.id,
+          user_id: user.id,
+          fit_score: fitScore,
+          status: fitScore >= fitThreshold ? "DRAFTED" : "SKIPPED",
+          reasons,
+        })
+        .select()
+        .single();
+
+      if (matchError) {
+        console.error(`Error creating match for ${job.title}:`, matchError);
+        continue;
+      }
+
+      const matchBundle = { match, job, fitScore };
+      allMatches.push(matchBundle);
+
+      if (fitScore >= fitThreshold) {
+        scoredMatches.push(matchBundle);
+      }
+    }
+
+    if (scoredMatches.length === 0 && allMatches.length > 0) {
+      const fallbackCount = Math.min(3, allMatches.length);
+      const fallbackMatches = [...allMatches]
+        .sort((a, b) => (b.fitScore ?? 0) - (a.fitScore ?? 0))
+        .slice(0, fallbackCount);
+
+      const fallbackIds = fallbackMatches.map((m) => m.match.id);
+      await supabase
+        .from("job_matches")
+        .update({ status: "DRAFTED" })
+        .in("id", fallbackIds);
+
+      scoredMatches.push(...fallbackMatches);
+      steps[1].message = `No jobs met the ${fitThreshold}% threshold. Drafting top ${fallbackCount} for demo.`;
+    } else {
+      steps[1].message = `${scoredMatches.length} jobs scored above ${fitThreshold}%`;
     }
 
     steps[1].status = "completed";
     steps[1].count = scoredMatches.length;
-    steps[1].message = `${scoredMatches.length} jobs scored above ${fitThreshold}%`;
     console.log(`Step 2 complete: ${scoredMatches.length} high-scoring matches`);
 
     // Step 3: Generate drafts for high-scoring matches
@@ -370,9 +436,15 @@ Deno.serve(async (req) => {
     let draftsCreated = 0;
 
     for (const { match, job } of scoredMatches) {
+      console.log(`Generating draft for: ${job.title}`);
+
+      let coverLetter = "";
+      let answersJson: Record<string, string> = {};
+      let confidence = 0.9;
+      let issues: string[] = [];
+      let draftContent = "";
+
       try {
-        console.log(`Generating draft for: ${job.title}`);
-        
         const draftResponse = await openai.chat.completions.create({
           model: "application_generator_v1",
           messages: [
@@ -399,80 +471,89 @@ Deno.serve(async (req) => {
           ],
         });
 
-        let coverLetter = "";
-        let answersJson: any = {};
-        let confidence = 1.0;
-        let issues: string[] = [];
-        
-        const draftContent = draftResponse.choices[0]?.message?.content || "";
+        draftContent = draftResponse.choices[0]?.message?.content || "";
         console.log(`Draft response for ${job.title}:`, draftContent.substring(0, 200));
-        
-        try {
-          // Try to extract JSON from response
-          const jsonMatch = draftContent.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            coverLetter = parsed.cover_letter || parsed.coverLetter || "";
-            answersJson = parsed.answers || {};
-            confidence = parsed.confidence ?? 0.9;
-            issues = parsed.issues || [];
-            
-            // Check for "NEEDS USER INPUT" markers
-            if (coverLetter.includes("NEEDS USER INPUT") || 
-                Object.values(answersJson).some(v => String(v).includes("NEEDS USER INPUT"))) {
-              issues.push("Some fields need user review");
-              confidence = Math.min(confidence, 0.5);
-            }
-          } else {
-            // If no JSON, treat the whole response as cover letter
-            coverLetter = draftContent;
-          }
-        } catch {
+
+        const parsed = parseJsonWithRetry(draftContent);
+        if (parsed && typeof parsed === "object") {
+          const parsedRecord = parsed as Record<string, unknown>;
+          coverLetter = String(parsedRecord.cover_letter ?? parsedRecord.coverLetter ?? "");
+          answersJson = normalizeAnswers(
+            parsedRecord.answers ?? parsedRecord.answers_json ?? parsedRecord.answersJson
+          );
+          let confidenceValue = coerceNumber(parsedRecord.confidence, 0.9);
+          if (confidenceValue > 1) confidenceValue = confidenceValue / 100;
+          confidence = Math.min(1, Math.max(0, confidenceValue));
+          issues = Array.isArray(parsedRecord.issues)
+            ? parsedRecord.issues.map((issue) => String(issue))
+            : [];
+        } else if (draftContent.trim()) {
           coverLetter = draftContent;
         }
-
-        // Determine status based on confidence
-        const matchStatus = confidence < 0.7 ? "NEEDS_REVIEW" : "DRAFTED";
-
-        // Update match status if needed
-        if (matchStatus !== "DRAFTED") {
-          await supabase
-            .from("job_matches")
-            .update({ status: matchStatus })
-            .eq("id", match.id);
-        }
-
-        // Create draft
-        const { error: draftError } = await supabase
-          .from("application_drafts")
-          .insert({
-            job_match_id: match.id,
-            cover_letter: coverLetter,
-            answers_json: answersJson,
-            tailoring_notes: { 
-              generated_at: new Date().toISOString(),
-              confidence,
-              issues,
-              prompt_name: "application_generator_v1",
-              model: "keywords_ai",
-            },
-            version_meta: {
-              version: 1,
-              prompt_name: "application_generator_v1",
-            },
-          });
-
-        if (draftError) {
-          console.error(`Error creating draft for ${job.title}:`, draftError);
-          continue;
-        }
-
-        draftsCreated++;
-        console.log(`Draft created for: ${job.title}`);
-
       } catch (draftError) {
         console.error(`Error generating draft for ${job.title}:`, draftError);
+        issues.push("LLM generation failed; using fallback draft.");
       }
+
+      if (!coverLetter) {
+        coverLetter = `Dear Hiring Manager,
+
+I am excited to apply for the ${job.title || "role"} at ${job.company || "your company"}. Based on my background and coursework, I believe I can contribute quickly and grow in this position.
+
+Thank you for your time and consideration. I look forward to the opportunity to discuss how I can help your team.
+
+Best regards`;
+        confidence = Math.min(confidence, 0.6);
+        issues.push("Draft content missing; fallback template used.");
+      }
+
+      // Check for "NEEDS USER INPUT" markers
+      if (
+        coverLetter.includes("NEEDS USER INPUT") ||
+        Object.values(answersJson).some((v) => String(v).includes("NEEDS USER INPUT"))
+      ) {
+        issues.push("Some fields need user review");
+        confidence = Math.min(confidence, 0.5);
+      }
+
+      // Determine status based on confidence
+      const matchStatus = confidence < 0.7 ? "NEEDS_REVIEW" : "DRAFTED";
+
+      // Update match status if needed
+      if (matchStatus !== "DRAFTED") {
+        await supabase
+          .from("job_matches")
+          .update({ status: matchStatus })
+          .eq("id", match.id);
+      }
+
+      // Create draft
+      const { error: draftError } = await supabase
+        .from("application_drafts")
+        .insert({
+          job_match_id: match.id,
+          cover_letter: coverLetter,
+          answers_json: answersJson,
+          tailoring_notes: { 
+            generated_at: new Date().toISOString(),
+            confidence,
+            issues,
+            prompt_name: "application_generator_v1",
+            model: "keywords_ai",
+          },
+          version_meta: {
+            version: 1,
+            prompt_name: "application_generator_v1",
+          },
+        });
+
+      if (draftError) {
+        console.error(`Error creating draft for ${job.title}:`, draftError);
+        continue;
+      }
+
+      draftsCreated++;
+      console.log(`Draft created for: ${job.title}`);
     }
 
     steps[2].status = "completed";
